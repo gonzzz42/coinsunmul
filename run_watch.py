@@ -1,13 +1,16 @@
-"""감시 체계 — 지정한 코인을 N분마다 전문가 관점으로 재분석하고,
+"""감시 체계 — 코인을 N분마다 전문가 관점으로 재분석하고,
 단계가 올라가거나 진입 시그널이 발동하면 알림을 보낸다.
 
 사용법:
-    python run_watch.py PEPEUSDT                       # 15분봉, 5분마다 점검
+    python run_watch.py --scan                         # 전 종목 스캐너 연동 (추천)
+    python run_watch.py PEPEUSDT                       # 직접 고른 코인 감시
+    python run_watch.py PEPEUSDT --scan                # 직접 + 스캐너 둘 다
     python run_watch.py PEPEUSDT --interval 1h --every 15
-    python run_watch.py PEPEUSDT DOGEUSDT              # 여러 코인 동시 감시
 
 동작:
-  - 시작할 때 각 코인의 전체 분석 보고서를 한 번 출력
+  - --scan: 30분마다 전 종목을 스캔해서 '급등 + 유동성 + OI 급증' 후보를
+    감시 목록에 자동 편입한다 (최대 --max-auto 개). 오래 no_setup이면 자동 제외.
+  - 시작(또는 편입) 시 전체 분석 보고서를 한 번 보낸다
   - 이후에는 단계가 "올라갈 때"만 알림 (🚨 = 진입 시그널, ✖ = 붕괴).
     단계가 내려가는 건 콘솔에 한 줄만 남긴다 — 경계에서 오르락내리락하며
     같은 알림이 반복되는 것을 막기 위해서다. 내려간 상태가 6번 연속 유지되면
@@ -19,16 +22,18 @@
 
 import argparse
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 
+from bot import scanner
 from bot.analyzer import STAGE_LABEL, analyze, format_report
 from bot.notifier import Notifier
 from run_analyze import fetch_all
 
 STAGE_RANK = {"no_setup": 0, "watching": 1, "armed": 2, "triggered": 3, "collapsed": 4}
-RESET_AFTER = 6   # 낮은 단계가 이만큼 연속되면 알림 래치를 푼다
+RESET_AFTER = 6    # 낮은 단계가 이만큼 연속되면 알림 래치를 푼다
+EVICT_AFTER = 12   # 자동 편입 코인이 no_setup을 이만큼 연속하면 목록에서 제외
 
 
 def check_once(symbol: str, interval: str, limit: int):
@@ -47,87 +52,164 @@ def build_alert(prev_stage: str, result) -> str:
     return head + "\n\n" + format_report(result)
 
 
+class Watcher:
+    """감시 상태(알림 래치·재전송 대기·자동 편입)를 관리한다."""
+
+    def __init__(self, args, notifier: Notifier) -> None:
+        self.args = args
+        self.notifier = notifier
+        self.symbols: list = [s.upper() for s in args.symbols]
+        self.manual = set(self.symbols)      # 사용자가 직접 고른 코인은 제외하지 않는다
+        self.notified_rank: dict = {}        # 심볼별 마지막으로 알림까지 보낸 단계
+        self.low_streak: dict = {}           # 낮은 단계 연속 횟수 (래치 해제용)
+        self.no_setup_streak: dict = {}      # 자동 편입 코인의 no_setup 연속 횟수
+        self.pending: dict = {}              # 전송 실패로 재전송 대기 중인 알림
+        self.intro: dict = {}                # 스캐너 편입 안내문 (첫 보고서에 붙임)
+        self.next_scan = datetime.min        # 다음 스캔 시각
+
+    # ── 스캐너 연동 ──────────────────────────────────────────────
+    def maybe_scan(self) -> None:
+        if not self.args.scan or datetime.now() < self.next_scan:
+            return
+        self.next_scan = datetime.now() + timedelta(minutes=self.args.scan_every)
+        print(f"[{datetime.now():%H:%M}] 전 종목 스캔 중...")
+        try:
+            candidates = scanner.scan()
+        except Exception as e:
+            print(f"  스캔 실패: {e} (다음 스캔에 재시도)")
+            return
+        auto_count = sum(1 for s in self.symbols if s not in self.manual)
+        for c in candidates:
+            if c.symbol in self.symbols:
+                continue
+            if auto_count >= self.args.max_auto:
+                print(f"  자동 감시 한도({self.args.max_auto}개) 도달 — {c.symbol} 보류")
+                continue
+            self.symbols.append(c.symbol)
+            self.intro[c.symbol] = f"🔎 스캐너 편입 — {c.describe()}"
+            auto_count += 1
+            print(f"  편입: {c.describe()}")
+        if not candidates:
+            print("  조건을 만족하는 신규 후보 없음")
+
+    def evict_if_stale(self, symbol: str, stage: str) -> bool:
+        """자동 편입 코인이 셋업 구조를 잃고 오래 지나면 목록에서 뺀다."""
+        if symbol in self.manual:
+            return False
+        if stage == "no_setup":
+            self.no_setup_streak[symbol] = self.no_setup_streak.get(symbol, 0) + 1
+            if self.no_setup_streak[symbol] >= EVICT_AFTER:
+                self.drop(symbol)
+                print(f"  {symbol}: 셋업 구조가 사라진 지 오래 — 감시 목록에서 제외")
+                return True
+        else:
+            self.no_setup_streak[symbol] = 0
+        return False
+
+    def drop(self, symbol: str) -> None:
+        if symbol in self.symbols:
+            self.symbols.remove(symbol)
+        for d in (self.notified_rank, self.low_streak,
+                  self.no_setup_streak, self.pending, self.intro):
+            d.pop(symbol, None)
+
+    # ── 알림 (전송 실패 시 재전송 대기) ──────────────────────────
+    def notify(self, symbol: str, text: str) -> None:
+        if not self.notifier.send(text):
+            self.pending[symbol] = text
+
+    def retry_pending(self, symbol: str) -> None:
+        if symbol in self.pending and self.notifier.send(self.pending[symbol]):
+            del self.pending[symbol]
+
+    # ── 심볼 1개 점검 ────────────────────────────────────────────
+    def check_symbol(self, symbol: str) -> None:
+        now = datetime.now().strftime("%H:%M")
+        self.retry_pending(symbol)
+        try:
+            result = check_once(symbol, self.args.interval, self.args.limit)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                print(f"[{now}] {symbol}: 심볼을 찾을 수 없음 (오타이거나 상장 폐지) "
+                      f"— 감시 목록에서 제외")
+                self.drop(symbol)
+            else:
+                print(f"[{now}] {symbol} 점검 실패: {e} (다음 주기에 재시도)")
+            return
+        except Exception as e:  # 네트워크 오류 등 — 감시는 계속한다
+            print(f"[{now}] {symbol} 점검 실패: {e} (다음 주기에 재시도)")
+            return
+
+        if self.evict_if_stale(symbol, result.stage):
+            return
+
+        rank = STAGE_RANK[result.stage]
+        prev_rank = self.notified_rank.get(symbol)
+
+        if prev_rank is None:
+            # 시작·편입 시 전체 보고서 1회 (triggered면 🚨 헤더 포함)
+            text = build_alert("", result) if result.stage == "triggered" \
+                else format_report(result)
+            if symbol in self.intro:
+                text = self.intro.pop(symbol) + "\n\n" + text
+            self.notified_rank[symbol] = rank
+            self.notify(symbol, text)
+            print()
+        elif rank > prev_rank:
+            prev_stage = next((k for k, v in STAGE_RANK.items() if v == prev_rank), "")
+            self.notified_rank[symbol] = rank
+            self.low_streak[symbol] = 0
+            self.notify(symbol, build_alert(prev_stage, result))
+            print()
+        else:
+            print(f"[{now}] {symbol}: {result.stage} "
+                  f"(점수 {result.total}/100, 현재가 {result.price:,.6g})")
+            if rank < prev_rank:
+                self.low_streak[symbol] = self.low_streak.get(symbol, 0) + 1
+                if self.low_streak[symbol] >= RESET_AFTER:
+                    self.notified_rank[symbol] = rank
+                    self.low_streak[symbol] = 0
+            else:
+                self.low_streak[symbol] = 0
+
+    def run(self) -> None:
+        while True:
+            self.maybe_scan()
+            for symbol in list(self.symbols):
+                self.check_symbol(symbol)
+                time.sleep(0.3)  # 요청 제한 보호
+            if not self.symbols and not self.args.scan:
+                print("감시할 심볼이 없어 종료합니다.")
+                return
+            time.sleep(self.args.every * 60)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="숏 셋업 감시 체계")
-    parser.add_argument("symbols", nargs="+", help="감시할 심볼 (여러 개 가능)")
+    parser.add_argument("symbols", nargs="*", help="감시할 심볼 (생략하고 --scan만 써도 됨)")
     parser.add_argument("--interval", default="15m")
     parser.add_argument("--limit", type=int, default=800)
     parser.add_argument("--every", type=int, default=5,
                         help="점검 주기(분), 기본 5분")
+    parser.add_argument("--scan", action="store_true",
+                        help="전 종목 스캐너로 후보를 자동 편입")
+    parser.add_argument("--scan-every", type=int, default=30,
+                        help="스캔 주기(분), 기본 30분")
+    parser.add_argument("--max-auto", type=int, default=8,
+                        help="자동 편입 최대 개수 (기본 8)")
     args = parser.parse_args()
-    symbols = [s.upper() for s in args.symbols]
+    if not args.symbols and not args.scan:
+        parser.error("감시할 심볼을 주거나 --scan 을 켜세요. 예: "
+                     "python run_watch.py --scan")
 
     notifier = Notifier()
-    print(f"감시 시작: {', '.join(symbols)} ({args.interval}봉, {args.every}분마다 점검)")
+    target = ", ".join(s.upper() for s in args.symbols) if args.symbols else "(스캐너 자동)"
+    print(f"감시 시작: {target} ({args.interval}봉, {args.every}분마다 점검"
+          + (f", {args.scan_every}분마다 스캔" if args.scan else "") + ")")
     print(f"텔레그램 알림: {'켜짐' if notifier.telegram_on else '꺼짐 (콘솔만)'}")
     print("중지하려면 Ctrl+C\n")
 
-    notified_rank: dict[str, int] = {}   # 심볼별 마지막으로 '알림까지 보낸' 단계
-    low_streak: dict[str, int] = {}      # 낮은 단계가 연속된 횟수 (래치 해제용)
-    pending: dict[str, str] = {}         # 전송 실패로 재전송 대기 중인 알림
-
-    while True:
-        for symbol in list(symbols):
-            now = datetime.now().strftime("%H:%M")
-
-            # 지난 주기에 전송 실패한 알림부터 재시도
-            if symbol in pending:
-                if notifier.send(pending[symbol]):
-                    del pending[symbol]
-
-            try:
-                result = check_once(symbol, args.interval, args.limit)
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 400:
-                    print(f"[{now}] {symbol}: 심볼을 찾을 수 없음 (오타이거나 "
-                          f"상장 폐지) — 감시 목록에서 제외")
-                    symbols.remove(symbol)
-                else:
-                    print(f"[{now}] {symbol} 점검 실패: {e} (다음 주기에 재시도)")
-                continue
-            except Exception as e:  # 네트워크 오류 등 — 감시는 계속한다
-                print(f"[{now}] {symbol} 점검 실패: {e} (다음 주기에 재시도)")
-                continue
-
-            rank = STAGE_RANK[result.stage]
-            prev_rank = notified_rank.get(symbol)
-
-            if prev_rank is None:
-                # 시작 시 전체 보고서 1회 (triggered 상태로 시작하면 🚨 포함)
-                text = build_alert("", result) if result.stage == "triggered" \
-                    else format_report(result)
-                if notifier.send(text):
-                    notified_rank[symbol] = rank
-                else:
-                    pending[symbol] = text
-                    notified_rank[symbol] = rank
-                print()
-            elif rank > prev_rank:
-                prev_stage = next((k for k, v in STAGE_RANK.items() if v == prev_rank), "")
-                text = build_alert(prev_stage, result)
-                if notifier.send(text):
-                    notified_rank[symbol] = rank
-                else:
-                    pending[symbol] = text
-                    notified_rank[symbol] = rank
-                low_streak[symbol] = 0
-                print()
-            else:
-                print(f"[{now}] {symbol}: {result.stage} "
-                      f"(점수 {result.total}/100, 현재가 {result.price:,.6g})")
-                # 낮은 단계가 오래 지속되면 래치를 풀어 다음 셋업에 대비
-                if rank < prev_rank:
-                    low_streak[symbol] = low_streak.get(symbol, 0) + 1
-                    if low_streak[symbol] >= RESET_AFTER:
-                        notified_rank[symbol] = rank
-                        low_streak[symbol] = 0
-                else:
-                    low_streak[symbol] = 0
-
-        if not symbols:
-            print("감시할 심볼이 없어 종료합니다.")
-            return
-        time.sleep(args.every * 60)
+    Watcher(args, notifier).run()
 
 
 if __name__ == "__main__":

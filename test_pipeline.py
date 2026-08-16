@@ -114,6 +114,22 @@ def main() -> None:
     assert r.stage == "no_setup" and r.notes, "캔들 부족은 분석 보류여야 함"
     print(f"[OK] 캔들 20개뿐인 상장 직후 코인: 분석 보류 처리")
 
+    # ── 스캐너 필터 (순수 로직) ──
+    from bot.scanner import filter_gainers
+    fake_tickers = [
+        {"symbol": "PUMPUSDT", "priceChangePercent": "45.2", "quoteVolume": "8000000"},
+        {"symbol": "BIGUSDT", "priceChangePercent": "62.0", "quoteVolume": "20000000"},
+        {"symbol": "THINUSDT", "priceChangePercent": "80.0", "quoteVolume": "500000"},   # 유동성 미달
+        {"symbol": "FLATUSDT", "priceChangePercent": "3.1", "quoteVolume": "90000000"},  # 급등 아님
+        {"symbol": "DOWNUSDT", "priceChangePercent": "-35.0", "quoteVolume": "9000000"}, # 하락
+        {"symbol": "SPOTONLY", "priceChangePercent": "50.0", "quoteVolume": "9000000"},  # 선물 아님
+        {"symbol": "BROKEN"},                                                            # 필드 누락
+    ]
+    perps = {"PUMPUSDT", "BIGUSDT", "THINUSDT", "FLATUSDT", "DOWNUSDT"}
+    got = filter_gainers(fake_tickers, perps, min_change=20, min_volume=3_000_000)
+    assert [c.symbol for c in got] == ["BIGUSDT", "PUMPUSDT"], got
+    print(f"[OK] 스캐너 필터: 7개 중 2개 선별, 상승률순 정렬 확인")
+
     print()
     print("── 박스 형성 시점(캔들 250)의 보고서 예시 ──")
     result = analyze("TEST-ALT", "1h", *snapshot(futures, spot, oi, funding, 250))

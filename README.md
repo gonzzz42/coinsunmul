@@ -4,12 +4,17 @@
 **차트를 사람 대신 읽고** 숏 셋업의 단계를 판정하고 진입가/손절가/목표가를
 제시하며, 진입 시점까지 감시하다가 알려주는 봇. 전체 설계는 [PLAN.md](PLAN.md).
 
-## 핵심 명령 2개
+## 핵심 명령 3개
 
 ```bash
+python run_watch.py --scan            # 전자동(추천): 스캔 → 편입 → 감시 → 알림
+python run_scan.py                    # 스캔 1회: 지금 시장의 숏 셋업 후보 목록
 python run_analyze.py PEPEUSDT        # 즉시 분석: 단계 판정 + 트레이드 플랜
-python run_watch.py PEPEUSDT          # 감시 체계: 5분마다 재분석, 변화 시 알림
 ```
+
+`run_watch.py --scan` 은 30분마다 전 종목을 스캔해서 "24h 급등 + 유동성 +
+OI 급증" 후보를 감시 목록에 자동 편입하고(최대 8개), 셋업 구조가 사라지면
+자동 제외한다. 코인을 직접 고를 필요가 없다.
 
 `run_analyze.py` 출력 예시:
 
@@ -86,6 +91,10 @@ python run_watch.py PEPEUSDT DOGEUSDT --every 5
 ```bash
 python run_analyze.py PEPEUSDT --interval 1h     # 캔들 간격 (기본 15m)
 python run_watch.py PEPEUSDT --every 15          # 점검 주기(분, 기본 5)
+python run_watch.py PEPEUSDT --scan              # 직접 고른 코인 + 스캐너 둘 다
+python run_watch.py --scan --max-auto 5          # 자동 편입 최대 개수 (기본 8)
+python run_scan.py --min-change 30               # 24h +30% 이상만 (기본 20)
+python run_scan.py --min-volume 10               # 거래대금 10M 이상만 (기본 3)
 python run_analyze.py PEPEUSDT --chart           # 검증용 차트 PNG 저장 (선택)
 ```
 
@@ -99,10 +108,12 @@ bot/
   collector.py    Binance 공개 API 수집 (캔들·OI·펀딩비, API 키 불필요)
   indicators.py   CVD 등 지표 계산
   analyzer.py     분석 엔진: 구조 탐지 -> 점수 평가 -> 단계 판정 + 레벨 계산
+  scanner.py      전 종목 스캐너: 급등 + 유동성 + OI 급증 후보 선별
   notifier.py     콘솔 + 텔레그램 알림
   chart.py        검증용 차트 (선택 도구)
+run_watch.py      감시 체계 (--scan 으로 스캐너 연동)
+run_scan.py       스캔 1회 실행
 run_analyze.py    즉시 분석
-run_watch.py      감시 체계
 test_pipeline.py  설치·엔진 확인용 오프라인 테스트
 PLAN.md           전체 설계·로드맵
 ```
@@ -111,7 +122,7 @@ PLAN.md           전체 설계·로드맵
 
 - [x] Phase 0~1: 수집기 + CVD 계산
 - [x] Phase 2: 분석 엔진(단계 판정 + 트레이드 플랜) + 감시·알림
-- [ ] Phase 3: 전 종목 자동 스캐너 (급등 코인을 직접 고르지 않아도 되게)
+- [x] Phase 3: 전 종목 자동 스캐너 + 감시 자동 편입/제외
 - [ ] Phase 4: 다중 거래소 집계 (Bybit, OKX)
 - [ ] Phase 5: 알림 기록 → 승률 통계로 점수·임계치 조정
 - [ ] Phase 6: 백테스트, 반자동 주문
