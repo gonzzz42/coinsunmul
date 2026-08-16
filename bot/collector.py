@@ -35,14 +35,19 @@ def _get(url: str, params: dict) -> list:
     return resp.json()
 
 
+KLINE_OUT_COLUMNS = ["time", "open", "high", "low", "close", "volume",
+                     "quote_volume", "taker_buy_volume", "taker_buy_quote_volume"]
+
+
 def _klines_to_df(raw: list) -> pd.DataFrame:
+    if not raw:  # 상장 직후 등 데이터가 아예 없는 경우
+        return pd.DataFrame(columns=KLINE_OUT_COLUMNS)
     df = pd.DataFrame(raw, columns=KLINE_COLUMNS)
     df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     numeric = ["open", "high", "low", "close", "volume",
                "quote_volume", "taker_buy_volume", "taker_buy_quote_volume"]
     df[numeric] = df[numeric].astype(float)
-    return df[["time", "open", "high", "low", "close", "volume",
-               "quote_volume", "taker_buy_volume", "taker_buy_quote_volume"]]
+    return df[KLINE_OUT_COLUMNS]
 
 
 def fetch_futures_klines(symbol: str, interval: str = "1h", limit: int = 500) -> pd.DataFrame:
@@ -63,6 +68,8 @@ def fetch_open_interest(symbol: str, period: str = "1h", limit: int = 500) -> pd
     """미결제약정(OI) 히스토리. Binance는 최근 30일까지만 제공한다."""
     raw = _get(f"{FUTURES_BASE}/futures/data/openInterestHist",
                {"symbol": symbol, "period": period, "limit": limit})
+    if not raw:  # 신규 상장 코인은 OI 스냅샷이 아직 쌓이지 않아 []를 준다
+        return pd.DataFrame(columns=["time", "open_interest", "open_interest_usd"])
     df = pd.DataFrame(raw)
     df["time"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df["open_interest"] = df["sumOpenInterest"].astype(float)
@@ -74,6 +81,8 @@ def fetch_funding(symbol: str, limit: int = 500) -> pd.DataFrame:
     """펀딩비 히스토리. 보통 8시간마다 1건씩 쌓인다."""
     raw = _get(f"{FUTURES_BASE}/fapi/v1/fundingRate",
                {"symbol": symbol, "limit": limit})
+    if not raw:  # 상장 8시간 미만이면 펀딩 정산 이력이 아직 없다
+        return pd.DataFrame(columns=["time", "funding_rate"])
     df = pd.DataFrame(raw)
     df["time"] = pd.to_datetime(df["fundingTime"], unit="ms", utc=True)
     df["funding_rate"] = df["fundingRate"].astype(float)

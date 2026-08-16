@@ -8,18 +8,34 @@
 """
 
 import argparse
+import sys
+
+import pandas as pd
+import requests
 
 from bot import collector, indicators
 from bot.analyzer import analyze, format_report
 
+# OI 히스토리 API는 5m 미만/3m을 지원하지 않는다
+OI_PERIOD_MAP = {"1m": "5m", "3m": "5m"}
+
 
 def fetch_all(symbol: str, interval: str, limit: int):
+    """분석에 필요한 4종 데이터 수집. 현물 시장이 없는 선물 전용 코인이면
+    현물은 빈 DataFrame으로 돌려준다 (analyzer가 알아서 처리)."""
     futures = indicators.add_cvd(collector.fetch_futures_klines(symbol, interval, limit))
-    spot = indicators.add_cvd(collector.fetch_spot_klines(symbol, interval, limit))
-    oi_period = interval if interval != "1m" else "5m"
+    try:
+        spot = indicators.add_cvd(collector.fetch_spot_klines(symbol, interval, limit))
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 400:
+            spot = pd.DataFrame(columns=list(futures.columns))  # 선물 전용 코인
+        else:
+            raise
+    oi_period = OI_PERIOD_MAP.get(interval, interval)
     oi = collector.fetch_open_interest(symbol, oi_period, min(limit, 500))
     funding = collector.fetch_funding(symbol, 500)
-    funding = funding[funding["time"] >= futures["time"].iloc[0]]
+    if len(funding) and len(futures):
+        funding = funding[funding["time"] >= futures["time"].iloc[0]]
     return futures, spot, oi, funding
 
 
@@ -35,7 +51,14 @@ def main() -> None:
     args = parser.parse_args()
     symbol = args.symbol.upper()
 
-    futures, spot, oi, funding = fetch_all(symbol, args.interval, args.limit)
+    try:
+        futures, spot, oi, funding = fetch_all(symbol, args.interval, args.limit)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 400:
+            print(f"심볼을 찾을 수 없습니다: {symbol} — 오타이거나 Binance 선물에 "
+                  f"없는 코인입니다. 예: BTCUSDT, PEPEUSDT")
+            sys.exit(1)
+        raise
     result = analyze(symbol, args.interval, futures, spot, oi, funding)
     print()
     print(format_report(result))

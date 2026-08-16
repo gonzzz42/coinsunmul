@@ -32,7 +32,7 @@ def synth_klines(futures: bool) -> list:
         elif i < DUMP_START:          # 고점 횡보
             drift, vol_base, buy_ratio = 0.0, 6e6, 0.51
         else:                         # 붕괴
-            drift, vol_base = -0.0003, 20e6
+            drift, vol_base = -0.0008, 20e6
             buy_ratio = 0.35 if futures else 0.45
         o = price
         c = max(price + drift + random.gauss(0, 0.0002), 0.003)
@@ -85,7 +85,8 @@ def main() -> None:
     scenarios = [
         ("펌핑 전 (횡보)", 90, {"no_setup"}),
         ("고점 박스 형성 후", 250, {"armed", "watching"}),
-        ("붕괴 이후", N, {"collapsed", "triggered"}),
+        ("박스 이탈 확정 직후", 263, {"triggered"}),
+        ("붕괴 이후", N, {"collapsed"}),
     ]
     for name, upto, expected in scenarios:
         result = analyze("TEST-ALT", "1h", *snapshot(futures, spot, oi, funding, upto))
@@ -93,6 +94,25 @@ def main() -> None:
         print(f"[{status}] {name}: stage={result.stage} (기대: {expected}) "
               f"점수 {result.total}/100")
         assert result.stage in expected, f"{name}: {result.stage} not in {expected}"
+
+    # ── 엣지케이스: 크래시 없이 처리되는지 ──
+    f250, s250, oi250, fund250 = snapshot(futures, spot, oi, funding, 250)
+    empty_spot = pd.DataFrame(columns=list(f250.columns))
+    r = analyze("FUT-ONLY", "1h", f250, empty_spot, oi250, fund250)
+    assert r.stage in {"armed", "watching"}, r.stage
+    led = next(c for c in r.checks_a if c.name == "선물 주도 펌핑")
+    assert led.points == 10, "현물 없는 코인은 선물 주도 확정이어야 함"
+    print(f"[OK] 현물 없는 선물 전용 코인: stage={r.stage}, 선물주도 {led.points}/10")
+
+    empty_oi = pd.DataFrame(columns=["time", "open_interest", "open_interest_usd"])
+    empty_funding = pd.DataFrame(columns=["time", "funding_rate"])
+    r = analyze("NEW-COIN", "1h", f250, s250, empty_oi, empty_funding)
+    print(f"[OK] OI·펀딩 이력 없는 신규 코인: stage={r.stage} (크래시 없음)")
+
+    r = analyze("TINY", "1h", f250.iloc[:20].reset_index(drop=True), s250,
+                oi250, fund250)
+    assert r.stage == "no_setup" and r.notes, "캔들 부족은 분석 보류여야 함"
+    print(f"[OK] 캔들 20개뿐인 상장 직후 코인: 분석 보류 처리")
 
     print()
     print("── 박스 형성 시점(캔들 250)의 보고서 예시 ──")

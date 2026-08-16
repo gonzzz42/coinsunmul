@@ -4,7 +4,7 @@
 출력: 지금 이 코인이 숏 셋업의 어느 단계인지 + 진입가/손절가/목표가
 
 단계(stage):
-  no_setup   해당 없음 — 펌핑 구조가 아님
+  no_setup   해당 없음 — 펌핑 구조가 아님 (또는 데이터 부족)
   watching   감시 중 — 펌핑은 확인, 셋업(무너질 준비)은 아직
   armed      준비 완료 — 구조 완성, 지지 이탈(트리거)만 대기
   triggered  진입 시그널 — 트리거 발동, 지금이 계획된 진입 자리
@@ -23,7 +23,7 @@ INTERVAL_MINUTES = {
 # 점수 임계치 (Phase 5에서 실제 승률 통계로 조정할 가설값)
 A_PASS = 25   # 컨텍스트 통과
 B_PASS = 25   # 셋업 통과
-C_PASS = 10   # 트리거 발동
+MIN_BARS = 30  # 이보다 캔들이 적으면 분석 자체를 보류한다
 
 
 @dataclass
@@ -48,8 +48,8 @@ class Analysis:
     checks_b: list = field(default_factory=list)
     checks_c: list = field(default_factory=list)
     # 가격 레벨 (펌핑 구조가 있을 때만 의미가 있다)
-    entry: float = 0.0        # 진입 트리거: 이 가격 하향 이탈 시 진입
-    stop: float = 0.0         # 손절: 박스 상단 위
+    entry: float = 0.0        # 진입 트리거: 이 가격 하향 이탈 확정 시 진입
+    stop: float = 0.0         # 손절: 최근 박스 상단 위
     target1: float = 0.0      # 1차 목표: 펌핑 구간 50% 되돌림
     target2: float = 0.0      # 2차 목표: 펌핑 시작점 부근
     box_bars: int = 0
@@ -100,23 +100,38 @@ def _pct(new: float, old: float) -> float:
     return (new / old - 1) * 100
 
 
+def _oi_at(oi: pd.DataFrame, when: pd.Timestamp) -> float:
+    """해당 시각(또는 그 직전)의 OI 값. 없으면 첫 값."""
+    ref = oi[oi["time"] <= when]
+    if len(ref):
+        return float(ref["open_interest_usd"].iloc[-1])
+    return float(oi["open_interest_usd"].iloc[0])
+
+
 def analyze(symbol: str, interval: str,
             futures: pd.DataFrame, spot: pd.DataFrame,
             oi: pd.DataFrame, funding: pd.DataFrame) -> Analysis:
     """모든 조건을 평가해서 단계와 가격 레벨을 담은 Analysis를 돌려준다.
 
     futures/spot은 indicators.add_cvd()를 거친 DataFrame이어야 한다.
+    spot은 비어 있어도 된다 (현물 시장이 없는 선물 전용 코인).
     """
     f = futures.reset_index(drop=True)
     s = spot.reset_index(drop=True)
     day = _bars_per_day(interval)
-    price = float(f["close"].iloc[-1])
+    price = float(f["close"].iloc[-1]) if len(f) else 0.0
     a = Analysis(symbol=symbol, interval=interval, stage="no_setup", price=price)
+
+    if len(f) < MIN_BARS:
+        a.notes.append(f"선물 캔들이 {len(f)}개뿐이라 분석 보류 "
+                       f"(최소 {MIN_BARS}개 필요 — 상장 직후 코인)")
+        return a
 
     # ── 펌핑 구조 찾기 ────────────────────────────────────────────
     # 1) 최근 8일 창에서 고점과 그 이전의 바닥(펌핑 시작점)을 찾고
-    # 2) "천장 구간(top zone)" = 펌핑폭의 상위 30% 가격대에 머문 캔들들로 박스를 잡는다.
-    #    고점 캔들 하나가 아니라 구간으로 잡아야 박스 안 노이즈에 흔들리지 않는다.
+    # 2) "천장 구간(top zone)" = 펌핑폭의 상위 30% 가격대에 종가가 있는
+    #    캔들들로 박스를 잡는다. 구간을 통째로 자르지 않고 조건을 만족하는
+    #    캔들만 박스 멤버로 취급해야, 중간의 급락 딥이 박스 하단을 오염시키지 않는다.
     look = min(len(f), day * 8)
     start = len(f) - look
     win = f.iloc[start:]
@@ -126,36 +141,31 @@ def analyze(symbol: str, interval: str,
     top_threshold = base_prelim + (high_price - base_prelim) * 0.7
 
     closes = f["close"]
-    in_top = closes >= top_threshold
-    top_idx = [i for i in range(start, len(f)) if bool(in_top.iloc[i])]
-    if top_idx:
-        box_start, box_end = top_idx[0], top_idx[-1]
-    else:
-        box_start = box_end = hi_pos
+    member_idx = [i for i in range(start, len(f))
+                  if float(closes.iloc[i]) >= top_threshold]
+    box_start = member_idx[0] if member_idx else hi_pos
     pump_base = float(f["low"].iloc[start:box_start + 1].min())
     a.pump_gain_pct = _pct(high_price, pump_base)
 
-    # 박스 범위 (마지막 캔들이 박스에 포함되면 진행 중이므로 레벨 계산에서 제외)
-    box_span = f.iloc[box_start:box_end + 1]
-    if box_end == len(f) - 1 and len(box_span) > 1:
-        box_levels = box_span.iloc[:-1]
+    # 마지막 캔들은 진행 중이므로 레벨 계산에서 제외
+    closed_members = [i for i in member_idx if i != len(f) - 1]
+    a.box_bars = len(closed_members)
+    # 레벨은 천장 구간 전체가 아니라 "최근 1일치 박스 멤버"로 잡는다 —
+    # 오래 횡보할수록 전체 범위는 넓어지는데, 실제 진입/손절은
+    # 이탈 직전의 좁은 박스 기준이어야 손익비가 나온다.
+    recent_members = closed_members[-min(len(closed_members), day):]
+    if recent_members:
+        box_high = float(f["high"].iloc[recent_members].max())
+        box_low = float(f["low"].iloc[recent_members].min())
     else:
-        box_levels = box_span
-    a.box_bars = len(box_levels)
-    # 레벨은 천장 구간 전체가 아니라 "최근 1일의 박스"로 잡는다.
-    # 천장에서 오래 횡보할수록 전체 범위는 넓어지는데, 실제 진입/손절은
-    # 이탈 직전에 만들어진 좁은 박스를 기준으로 해야 손익비가 나온다.
-    recent_box = box_levels.iloc[-min(len(box_levels), day):] if len(box_levels) \
-        else f.iloc[-2:-1]
-    box_high = float(recent_box["high"].max())
-    box_low = float(recent_box["low"].min())
+        box_high, box_low = high_price, float(f["low"].iloc[-1])
 
     # ── 가격 레벨 ────────────────────────────────────────────────
     a.entry = box_low
     a.stop = box_high * 1.005                 # 최근 박스 상단 + 0.5% 여유
     a.target1 = high_price - (high_price - pump_base) * 0.5
     a.target2 = pump_base
-    if a.rr1 < 1.5 and a.entry > 0:
+    if 0 < a.rr1 < 1.5:
         a.notes.append(f"손익비 {a.rr1:.1f}로 낮음 — 진입 매력이 떨어지는 자리")
 
     # ── A. 컨텍스트: 이 코인을 감시할 이유가 있나? (40점) ─────────
@@ -165,84 +175,106 @@ def analyze(symbol: str, interval: str,
                             f"24h {chg24:+.1f}%, 펌핑폭 +{a.pump_gain_pct:.0f}%"))
 
     # OI 증가는 24시간이 아니라 "펌핑이 시작된 뒤 얼마나 쌓였나"로 잰다
+    pump_ref = max(start, box_start - day * 3)   # 펌핑 시작 부근
+    pump_time = f["time"].iloc[pump_ref]
     oi_chg = 0.0
     if len(oi) >= 2:
-        pump_start_time = f["time"].iloc[max(start, box_start - day * 3)]
-        ref = oi[oi["time"] <= pump_start_time]
-        ref_val = float(ref["open_interest_usd"].iloc[-1]) if len(ref) \
-            else float(oi["open_interest_usd"].iloc[0])
-        oi_chg = _pct(float(oi["open_interest_usd"].iloc[-1]), ref_val)
+        oi_chg = _pct(float(oi["open_interest_usd"].iloc[-1]), _oi_at(oi, pump_time))
     pts = 15 if oi_chg >= 50 else (8 if oi_chg >= 20 else 0)
     a.checks_a.append(Check("OI 급증", pts, 15, f"펌핑 이후 OI {oi_chg:+.1f}%"))
 
-    # 펌핑 구간의 선물 CVD 증가량 vs 현물 CVD 증가량
-    pump_ref = max(start, box_start - day * 3)   # 펌핑 시작 부근
-    s_base = min(pump_ref, len(s) - 1)
+    # 펌핑 구간의 선물 CVD 증가량 vs 현물 CVD 증가량.
+    # 현물은 선물과 캔들 개수가 다를 수 있으므로 반드시 '시간'으로 정렬한다.
     fut_d = float(f["cvd"].iloc[-1] - f["cvd"].iloc[pump_ref])
-    spot_d = float(s["cvd"].iloc[-1] - s["cvd"].iloc[s_base])
-    ratio = abs(fut_d) / max(abs(spot_d), 1e-9)
-    futures_led = fut_d > 0 and (spot_d <= 0 or ratio >= 3)
-    pts = 10 if (futures_led and ratio >= 5) else (5 if futures_led else 0)
-    a.checks_a.append(Check("선물 주도 펌핑", pts, 10,
-                            f"선물 CVD +{fut_d:,.0f} vs 현물 {spot_d:+,.0f} ({ratio:.1f}배)"))
+    if len(s) == 0:
+        a.checks_a.append(Check("선물 주도 펌핑", 10, 10,
+                                "현물 시장 없음(선물 전용 코인) — 현물 실수요가 없는 것이 확정"))
+    elif s["time"].iloc[0] > pump_time:
+        a.checks_a.append(Check("선물 주도 펌핑", 0, 10,
+                                "현물 캔들이 펌핑 구간을 덮지 못함 — 판단 보류"))
+    else:
+        s_pos = min(int(s["time"].searchsorted(pump_time)), len(s) - 1)
+        spot_d = float(s["cvd"].iloc[-1] - s["cvd"].iloc[s_pos])
+        ratio = abs(fut_d) / max(abs(spot_d), 1e-9)
+        futures_led = fut_d > 0 and (spot_d <= 0 or ratio >= 3)
+        pts = 10 if (futures_led and (spot_d <= 0 or ratio >= 5)) else (5 if futures_led else 0)
+        a.checks_a.append(Check("선물 주도 펌핑", pts, 10,
+                                f"선물 CVD {fut_d:+,.0f} vs 현물 {spot_d:+,.0f}"
+                                + (f" ({ratio:.1f}배)" if abs(spot_d) > 1 else "")))
 
     # ── B. 셋업: 무너질 준비가 됐나? (40점) ──────────────────────
-    recent = max(6, day // 4)
-    price_recent_hi = float(f["high"].iloc[-recent:].max())
-    price_prior_hi = float(f["high"].iloc[-look:-recent].max()) if look > recent else price_recent_hi
-    cvd_recent_hi = float(f["cvd"].iloc[-recent:].max())
-    cvd_prior_hi = float(f["cvd"].iloc[-look:-recent].max()) if look > recent else cvd_recent_hi
-    diverging = price_recent_hi >= price_prior_hi * 0.999 and cvd_recent_hi < cvd_prior_hi
-    a.checks_b.append(Check("약세 다이버전스", 15 if diverging else 0, 15,
-                            "가격은 고점 근처인데 선물 CVD 고점 미갱신" if diverging
-                            else "다이버전스 없음"))
+    # 매수세 소진: 가격은 천장 박스에 머무는데 선물 CVD가 박스 시작보다
+    # 늘지 않았다면, 박스를 지탱할 신규 매수가 끊긴 것. (고점 근처 재도전
+    # 여부와 무관하게 박스가 유지되는 동안 안정적으로 평가된다)
+    if a.box_bars >= 3:
+        cvd_at_box = float(f["cvd"].iloc[box_start])
+        cvd_now = float(f["cvd"].iloc[-1])
+        exhausted = cvd_now <= cvd_at_box
+        a.checks_b.append(Check("매수세 소진 (박스 내 CVD 정체)", 15 if exhausted else 0, 15,
+                                f"박스 시작 대비 선물 CVD {cvd_now - cvd_at_box:+,.0f}"))
+    else:
+        a.checks_b.append(Check("매수세 소진 (박스 내 CVD 정체)", 0, 15, "박스 미형성"))
 
     fr_last = float(funding["funding_rate"].iloc[-1]) if len(funding) else 0.0
     fr_prev = float(funding["funding_rate"].iloc[-4:-1].mean()) if len(funding) >= 4 else fr_last
     overheated = fr_last >= 0.0005              # 8시간당 +0.05% 이상 = 롱 과열
-    jumped = abs(fr_last - fr_prev) >= 0.0005   # 급변 자체도 신호
-    a.checks_b.append(Check("펀딩비 과열/급변", 10 if (overheated or jumped) else 0, 10,
+    jumped = (fr_last - fr_prev) >= 0.0005      # 롱 과열 '방향'의 급변만 가점
+    a.checks_b.append(Check("펀딩비 롱 과열", 10 if (overheated or jumped) else 0, 10,
                             f"최근 {fr_last * 100:+.4f}% (직전 평균 {fr_prev * 100:+.4f}%)"))
+    if fr_last <= -0.0005:
+        a.notes.append("펀딩 음수 — 숏이 이미 과밀. 숏 스퀴즈(급반등) 위험이 큰 자리")
 
+    # OI 유지: 붕괴 캔들에서 청산으로 OI가 급감하면 '유지' 체크가 스스로
+    # 무너지므로, 마지막 '박스 멤버 캔들'까지의 OI로 평가한다 (이탈 이후 제외).
     oi_hold = False
-    if len(oi) >= 2 and a.box_bars >= max(4, day // 6):
-        ref = oi[oi["time"] <= f["time"].iloc[box_start]]
-        oi_at_box = float(ref["open_interest_usd"].iloc[-1]) if len(ref) \
-            else float(oi["open_interest_usd"].iloc[0])
-        oi_now = float(oi["open_interest_usd"].iloc[-1])
-        oi_hold = oi_now >= oi_at_box * 0.95
+    if len(oi) >= 2 and a.box_bars >= max(4, day // 6) and closed_members:
+        oi_at_box = _oi_at(oi, f["time"].iloc[box_start])
+        oi_pre_break = _oi_at(oi, f["time"].iloc[closed_members[-1]])
+        oi_hold = oi_pre_break >= oi_at_box * 0.95
     a.checks_b.append(Check("고점 횡보 중 OI 유지", 15 if oi_hold else 0, 15,
                             f"박스 {a.box_bars}캔들 동안 OI "
                             + ("유지·증가 (롱이 탈출 못 함)" if oi_hold else "감소 또는 박스 미형성")))
 
     # ── C. 트리거: 지금인가? (20점) ──────────────────────────────
-    broke = price < box_low and a.box_bars >= 2
-    a.checks_c.append(Check("지지(박스 하단) 이탈", 10 if broke else 0, 10,
-                            f"박스 하단 {box_low:,.6g} vs 현재가 {price:,.6g}"))
+    # 이탈은 '확정봉'(마감된 직전 캔들) 기준 — 진행 중 캔들이 박스 하단을
+    # 넘나들 때마다 알림이 반복되는 것을 막는다.
+    confirm_close = float(f["close"].iloc[-2]) if len(f) >= 2 else price
+    broke = confirm_close < box_low and a.box_bars >= 3
+    a.checks_c.append(Check("지지(박스 하단) 이탈 확정", 10 if broke else 0, 10,
+                            f"박스 하단 {box_low:,.6g} vs 확정봉 종가 {confirm_close:,.6g}"))
 
-    avg_abs_delta = float(f["delta"].abs().iloc[-day:].mean()) if len(f) >= day else 0.0
+    delta_win = f["delta"].abs().iloc[-min(day, len(f)):]
+    avg_abs_delta = float(delta_win.mean())
     last_delta = float(f["delta"].iloc[-1])
-    heavy_sell = last_delta < 0 and abs(last_delta) >= 2 * max(avg_abs_delta, 1e-9)
+    heavy_sell = (last_delta < 0 and avg_abs_delta > 0
+                  and abs(last_delta) >= 2 * avg_abs_delta)
     a.checks_c.append(Check("대량 매도 압력", 10 if heavy_sell else 0, 10,
-                            f"현재 캔들 델타 {last_delta:,.0f} (하루 평균의 "
-                            f"{abs(last_delta) / max(avg_abs_delta, 1e-9):.1f}배)"))
+                            f"현재 캔들 델타 {last_delta:,.0f} "
+                            f"(평균의 {abs(last_delta) / max(avg_abs_delta, 1e-9):.1f}배)"))
 
     # ── 단계 판정 ────────────────────────────────────────────────
+    # 순서에 주의: 이탈 확정(broke)은 B보다 우선한다. 붕괴 캔들에서는
+    # 청산 때문에 B 점수(OI 유지 등)가 무너지는 게 정상이라, B를 그 시점에
+    # 다시 요구하면 정작 진입 시그널이 누락된다.
+    a_ok = a.score_a >= A_PASS
     if price < a.target1 and a.pump_gain_pct >= 25:
-        # 이미 펌핑폭의 절반 이상 무너짐 — 계획했던 자리는 지나갔다
         a.stage = "collapsed"
         a.notes.append("계획된 진입 자리(박스 이탈 직후)를 지나 이미 급락함. "
                        "추격 숏은 반등(숏 스퀴즈)에 청산되기 쉬운 자리 — 다음 기회를 기다릴 것")
-    elif a.score_a < A_PASS:
+    elif not a_ok:
         a.stage = "no_setup"
+    elif broke:
+        a.stage = "triggered"
+        gap = _pct(price, a.entry)
+        if gap < -2:
+            a.notes.append(f"이탈 후 이미 {gap:+.1f}% 진행 — 시장가 추격 대신 "
+                           f"박스 하단({a.entry:,.6g}) 리테스트를 기다릴 것")
     elif a.score_b < B_PASS or a.box_bars < 3:
         a.stage = "watching"
         if a.box_bars < 3:
             a.notes.append("펌핑 직후라 천장 박스가 아직 안 만들어짐 — 박스 형성 대기")
-    elif a.score_c < C_PASS:
-        a.stage = "armed"
     else:
-        a.stage = "triggered"
+        a.stage = "armed"
     return a
 
 
@@ -267,15 +299,18 @@ def format_report(a: Analysis) -> str:
     for title, checks in (("A. 컨텍스트", a.checks_a),
                           ("B. 셋업", a.checks_b),
                           ("C. 트리거", a.checks_c)):
+        if not checks:
+            continue
         lines.append(title)
         for c in checks:
             mark = "✓" if c.passed else "✗"
             lines.append(f"  {mark} {c.name} [{c.points}/{c.max_points}] — {c.detail}")
-    lines.append("")
+    if a.checks_a:
+        lines.append("")
 
     if a.stage in ("armed", "triggered"):
         lines.append("트레이드 플랜 (숏)")
-        lines.append(f"  진입: {a.entry:,.6g} 하향 이탈 확인 후 "
+        lines.append(f"  진입: {a.entry:,.6g} 하향 이탈 확정 후 "
                      f"(현재가 대비 {_pct(a.entry, a.price):+.1f}%)")
         lines.append(f"  손절: {a.stop:,.6g} (진입가 대비 +{a.risk_pct:.1f}%) — 박스 상단 위")
         lines.append(f"  1차 목표: {a.target1:,.6g} (펌핑 50% 되돌림) · 손익비 {a.rr1:.1f}")
