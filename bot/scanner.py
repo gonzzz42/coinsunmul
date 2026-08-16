@@ -31,10 +31,15 @@ class Candidate:
     change_pct: float          # 24h 상승률
     quote_volume: float        # 24h 거래대금 (USDT)
     oi_change_pct: float | None = None  # 24h OI 증가율 (None = 이력 없음/신규)
+    oi_error: bool = False     # OI 조회 자체가 실패함 (신규 상장과 구분)
 
     def describe(self) -> str:
-        oi = (f"OI {self.oi_change_pct:+.0f}%" if self.oi_change_pct is not None
-              else "OI 이력 없음(신규)")
+        if self.oi_error:
+            oi = "OI 확인 실패(일시 오류)"
+        elif self.oi_change_pct is not None:
+            oi = f"OI {self.oi_change_pct:+.0f}%"
+        else:
+            oi = "OI 이력 없음(신규)"
         return (f"{self.symbol}: 24h {self.change_pct:+.1f}%, "
                 f"거래대금 {self.quote_volume / 1e6:,.0f}M, {oi}")
 
@@ -102,7 +107,7 @@ def scan(min_change: float = MIN_CHANGE_PCT,
         try:
             c.oi_change_pct = oi_change_24h(c.symbol)
         except requests.RequestException:
-            c.oi_change_pct = None
+            c.oi_error = True  # 오류는 '신규 상장'과 구분해서 표기한다
         if c.oi_change_pct is None or c.oi_change_pct >= min_oi_change:
             candidates.append(c)
         time.sleep(0.2)  # 개별 조회 사이 간격 (요청 제한 보호)

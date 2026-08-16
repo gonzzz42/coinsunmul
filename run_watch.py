@@ -34,6 +34,9 @@ from run_analyze import fetch_all
 STAGE_RANK = {"no_setup": 0, "watching": 1, "armed": 2, "triggered": 3, "collapsed": 4}
 RESET_AFTER = 6    # 낮은 단계가 이만큼 연속되면 알림 래치를 푼다
 EVICT_AFTER = 12   # 자동 편입 코인이 no_setup을 이만큼 연속하면 목록에서 제외
+EVICT_COOLDOWN_HOURS = 4  # 제외된 코인은 이 시간 동안 재편입하지 않는다
+# 24h 급등 통계는 하루 동안 유지되므로, 쿨다운이 없으면 셋업 없는 코인이
+# 편입 -> 1시간 감시 -> 제외 -> 다음 스캔에 재편입을 반복하며 같은 알림을 계속 보낸다.
 
 
 def check_once(symbol: str, interval: str, limit: int):
@@ -66,22 +69,32 @@ class Watcher:
         self.pending: dict = {}              # 전송 실패로 재전송 대기 중인 알림
         self.intro: dict = {}                # 스캐너 편입 안내문 (첫 보고서에 붙임)
         self.next_scan = datetime.min        # 다음 스캔 시각
+        self.evicted: dict = {}              # 제외 심볼 -> 재편입 허용 시각 (쿨다운)
+        self.bad_symbols: set = set()        # 400(심볼 없음)으로 제외 — 재편입 금지
 
     # ── 스캐너 연동 ──────────────────────────────────────────────
     def maybe_scan(self) -> None:
-        if not self.args.scan or datetime.now() < self.next_scan:
+        now = datetime.now()
+        if not self.args.scan or now < self.next_scan:
             return
-        self.next_scan = datetime.now() + timedelta(minutes=self.args.scan_every)
-        print(f"[{datetime.now():%H:%M}] 전 종목 스캔 중...")
+        print(f"[{now:%H:%M}] 전 종목 스캔 중...")
         try:
             candidates = scanner.scan()
         except Exception as e:
-            print(f"  스캔 실패: {e} (다음 스캔에 재시도)")
+            # 일시 오류로 30분을 통째로 쉬지 않도록 다음 점검 주기에 재시도
+            self.next_scan = now + timedelta(minutes=self.args.every)
+            print(f"  스캔 실패: {e} ({self.args.every}분 뒤 재시도)")
             return
+        self.next_scan = now + timedelta(minutes=self.args.scan_every)
         auto_count = sum(1 for s in self.symbols if s not in self.manual)
         for c in candidates:
-            if c.symbol in self.symbols:
+            if c.symbol in self.symbols or c.symbol in self.bad_symbols:
                 continue
+            allowed_at = self.evicted.get(c.symbol)
+            if allowed_at is not None:
+                if now < allowed_at:
+                    continue  # 쿨다운 중 — 최근에 제외된 코인
+                del self.evicted[c.symbol]
             if auto_count >= self.args.max_auto:
                 print(f"  자동 감시 한도({self.args.max_auto}개) 도달 — {c.symbol} 보류")
                 continue
@@ -100,7 +113,10 @@ class Watcher:
             self.no_setup_streak[symbol] = self.no_setup_streak.get(symbol, 0) + 1
             if self.no_setup_streak[symbol] >= EVICT_AFTER:
                 self.drop(symbol)
-                print(f"  {symbol}: 셋업 구조가 사라진 지 오래 — 감시 목록에서 제외")
+                self.evicted[symbol] = (datetime.now()
+                                        + timedelta(hours=EVICT_COOLDOWN_HOURS))
+                print(f"  {symbol}: 셋업 구조가 사라진 지 오래 — 감시 목록에서 제외 "
+                      f"(재편입은 {EVICT_COOLDOWN_HOURS}시간 뒤부터)")
                 return True
         else:
             self.no_setup_streak[symbol] = 0
@@ -133,6 +149,7 @@ class Watcher:
                 print(f"[{now}] {symbol}: 심볼을 찾을 수 없음 (오타이거나 상장 폐지) "
                       f"— 감시 목록에서 제외")
                 self.drop(symbol)
+                self.bad_symbols.add(symbol)  # 스캐너가 다시 편입하지 않도록
             else:
                 print(f"[{now}] {symbol} 점검 실패: {e} (다음 주기에 재시도)")
             return
