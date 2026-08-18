@@ -77,6 +77,61 @@ def fetch_open_interest(symbol: str, period: str = "1h", limit: int = 500) -> pd
     return df[["time", "open_interest", "open_interest_usd"]]
 
 
+def _klines_range(url: str, symbol: str, interval: str,
+                  start_ms: int, end_ms: int) -> pd.DataFrame:
+    """기간 지정 캔들 수집 (백테스트용). 1500개씩 페이지를 넘기며 모은다."""
+    out: list = []
+    cur = int(start_ms)
+    while cur < end_ms:
+        raw = _get(url, {"symbol": symbol, "interval": interval,
+                         "startTime": cur, "endTime": int(end_ms), "limit": 1500})
+        if not raw:
+            break
+        out.extend(raw)
+        if len(raw) < 1500:
+            break
+        cur = int(raw[-1][0]) + 1  # 마지막 캔들 시작시각 다음부터
+        time.sleep(0.15)           # 요청 제한 보호
+    return _klines_to_df(out)
+
+
+def fetch_futures_klines_range(symbol: str, interval: str,
+                               start_ms: int, end_ms: int) -> pd.DataFrame:
+    return _klines_range(f"{FUTURES_BASE}/fapi/v1/klines", symbol, interval,
+                         start_ms, end_ms)
+
+
+def fetch_spot_klines_range(symbol: str, interval: str,
+                            start_ms: int, end_ms: int) -> pd.DataFrame:
+    return _klines_range(f"{SPOT_BASE}/api/v3/klines", symbol, interval,
+                         start_ms, end_ms)
+
+
+def fetch_open_interest_range(symbol: str, period: str,
+                              start_ms: int, end_ms: int) -> pd.DataFrame:
+    """기간 지정 OI 수집. Binance는 최근 30일까지만 제공한다."""
+    out: list = []
+    cur = int(start_ms)
+    while cur < end_ms:
+        raw = _get(f"{FUTURES_BASE}/futures/data/openInterestHist",
+                   {"symbol": symbol, "period": period,
+                    "startTime": cur, "endTime": int(end_ms), "limit": 500})
+        if not raw:
+            break
+        out.extend(raw)
+        if len(raw) < 500:
+            break
+        cur = int(raw[-1]["timestamp"]) + 1
+        time.sleep(0.15)
+    if not out:
+        return pd.DataFrame(columns=["time", "open_interest", "open_interest_usd"])
+    df = pd.DataFrame(out)
+    df["time"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df["open_interest"] = df["sumOpenInterest"].astype(float)
+    df["open_interest_usd"] = df["sumOpenInterestValue"].astype(float)
+    return df[["time", "open_interest", "open_interest_usd"]]
+
+
 def fetch_funding(symbol: str, limit: int = 500) -> pd.DataFrame:
     """펀딩비 히스토리. 보통 8시간마다 1건씩 쌓인다."""
     raw = _get(f"{FUTURES_BASE}/fapi/v1/fundingRate",

@@ -4,13 +4,14 @@
 **차트를 사람 대신 읽고** 숏 셋업의 단계를 판정하고 진입가/손절가/목표가를
 제시하며, 진입 시점까지 감시하다가 알려주는 봇. 전체 설계는 [PLAN.md](PLAN.md).
 
-## 핵심 명령 4개
+## 핵심 명령 5개
 
 ```bash
 python run_watch.py --scan            # 전자동(추천): 스캔 → 편입 → 감시 → 알림
 python run_scan.py                    # 스캔 1회: 지금 시장의 숏 셋업 후보 목록
 python run_analyze.py PEPEUSDT        # 즉시 분석: 단계 판정 + 트레이드 플랜
 python run_stats.py                   # 성적표: 지금까지 시그널의 승률·수익률 통계
+python run_backtest.py PEPEUSDT       # 백테스트: 최근 30일 리플레이로 승률 추정
 ```
 
 `run_watch.py --scan` 은 30분마다 전 종목을 스캔해서 "24h 급등 + 유동성 +
@@ -59,6 +60,18 @@ A. 컨텍스트
 
 표본 50건이 쌓이기 전까지는 통계가 아니라 소음이다. 봇을 며칠 켜두고
 성적표부터 확인한 뒤에 실거래 여부를 판단할 것.
+
+### 백테스트 (Phase 6)
+
+```bash
+python run_backtest.py PEPEUSDT DOGEUSDT --days 30
+```
+
+과거 데이터를 바 단위로 리플레이해서 **라이브와 완전히 같은 코드**로 시그널을
+잡고(look-ahead 방지: 매 바마다 그 시점까지의 데이터만 사용), 같은 판정
+규칙으로 승/패를 계산한다. 백테스트 전용 로직이 없으므로 "백테스트에서만
+이기는 전략"이 나올 수 없다. Binance OI 히스토리 한계로 최대 30일.
+급등했던 코인 여러 개를 넣고 돌리면 며칠 기다리지 않고 표본을 모을 수 있다.
 
 ### 다중 거래소 집계 (Phase 4)
 
@@ -135,13 +148,13 @@ bot/
   store.py        시그널 기록 + 승률·수익률 자동 추적 (SQLite)
   notifier.py     콘솔 + 텔레그램 알림
   chart.py        검증용 차트 (선택 도구)
+  backtest.py     백테스트: 과거 데이터 리플레이 (라이브와 같은 코드 사용)
 run_watch.py      감시 체계 (--scan 으로 스캐너 연동, 시그널 자동 기록)
 run_scan.py       스캔 1회 실행
 run_analyze.py    즉시 분석
 run_stats.py      승률·수익률 성적표
-test_pipeline.py  설치·엔진 확인용 오프라인 테스트
-test_watch.py     감시 체계 오프라인 테스트
-test_store.py     기록·승률 모듈 오프라인 테스트
+run_backtest.py   백테스트 실행
+test_*.py         오프라인 테스트 5종 (인터넷 없이 실행 가능)
 PLAN.md           전체 설계·로드맵
 ```
 
@@ -152,7 +165,8 @@ PLAN.md           전체 설계·로드맵
 - [x] Phase 3: 전 종목 자동 스캐너 + 감시 자동 편입/제외
 - [x] Phase 4: 다중 거래소 OI 집계 (Bybit, OKX)
 - [x] Phase 5: 시그널 기록 → 승률·수익률 통계 (점수 조정 근거)
-- [ ] Phase 6: 백테스트, 반자동 주문
+- [x] Phase 6a: 백테스트 (최근 30일 리플레이)
+- [ ] Phase 6b: (선택) 반자동 주문 — 승률 검증을 통과한 뒤에만
 
 ## 주의
 
