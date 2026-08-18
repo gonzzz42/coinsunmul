@@ -41,6 +41,15 @@ def main() -> None:
         list(out["open_interest_usd"])
     print("[OK] 3개 거래소 합산: 100(Binance) + 20(Bybit) + 50(OKX) = 170")
 
+    # 1b) 창 불일치: Bybit 히스토리가 늦게 시작해도(평평한 OI) 계단이 생기면 안 됨
+    #     — 계단이 생기면 실제 변화 0%가 'OI 급증'으로 오판된다
+    aggregate.fetch_bybit_oi = lambda s, i, limit=200: pd.DataFrame(
+        {"time": [T0 + H, T0 + 2 * H], "oi_coins": [10.0, 10.0]})  # T0 이전 없음
+    out, sources = aggregate.aggregate_oi("PEPEUSDT", "1h", binance_oi, binance_close)
+    assert list(out["open_interest_usd"]) == [170.0, 170.0, 170.0], \
+        f"창 시작 전 구간이 0으로 채워져 계단 발생: {list(out['open_interest_usd'])}"
+    print("[OK] 거래소별 히스토리 창 불일치: 첫 관측값으로 채워 계단 없음")
+
     # 2) Bybit 실패: 조용히 빼고 나머지로 합산
     def boom(*a, **kw):
         raise requests.ConnectionError("bybit down")

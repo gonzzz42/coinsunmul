@@ -73,13 +73,19 @@ def fetch_okx_oi_usd(symbol: str, interval: str) -> pd.DataFrame:
 
 
 def _asof_join(base_times: pd.Series, other: pd.DataFrame, col: str) -> pd.Series:
-    """other의 값을 base 시각마다 '그 시각 이전의 최신 값'으로 붙인다."""
+    """other의 값을 base 시각마다 '그 시각 이전의 최신 값'으로 붙인다.
+
+    중요: 거래소마다 조회 가능한 히스토리 길이가 다르다 (예: Binance 5일,
+    Bybit 2일). 창 시작 이전 구간을 0으로 채우면 합산 시계열에 '거래소 합류
+    계단'이 생겨서, 실제 OI가 완전히 평평해도 analyzer가 'OI 급증 +100%'로
+    오판한다. 그래서 창 이전 구간은 그 거래소의 '첫 관측값'으로 채운다 —
+    변화가 없었다고 가정하는 보수적 근사라 급증을 부풀리지 않는다."""
     if not len(other):
         return pd.Series([0.0] * len(base_times))
     merged = pd.merge_asof(
         pd.DataFrame({"time": base_times}).sort_values("time"),
         other.sort_values("time"), on="time", direction="backward")
-    return merged[col].fillna(0.0)
+    return merged[col].bfill().fillna(0.0)
 
 
 def aggregate_oi(symbol: str, interval: str,
