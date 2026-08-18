@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 
 import requests
 
-from bot import scanner
+from bot import collector, scanner, store
 from bot.analyzer import STAGE_LABEL, analyze, format_report
 from bot.notifier import Notifier
 from run_analyze import fetch_all
@@ -71,6 +71,7 @@ class Watcher:
         self.next_scan = datetime.min        # 다음 스캔 시각
         self.evicted: dict = {}              # 제외 심볼 -> 재편입 허용 시각 (쿨다운)
         self.bad_symbols: set = set()        # 400(심볼 없음)으로 제외 — 재편입 금지
+        self.next_outcome = datetime.min     # 다음 결과(승률 기록) 업데이트 시각
 
     # ── 스캐너 연동 ──────────────────────────────────────────────
     def maybe_scan(self) -> None:
@@ -129,6 +130,25 @@ class Watcher:
                   self.no_setup_streak, self.pending, self.intro):
             d.pop(symbol, None)
 
+    # ── 시그널 기록 (Phase 5: 승률 통계의 재료) ──────────────────
+    def record(self, result) -> None:
+        if result.stage not in ("armed", "triggered"):
+            return
+        try:
+            store.record_signal(result)
+        except Exception as e:  # 기록 실패가 감시를 멈추면 안 된다
+            print(f"  (시그널 기록 실패: {e})")
+
+    def maybe_update_outcomes(self) -> None:
+        """기록된 시그널의 1h/4h/24h 결과를 주기적으로 채운다 (30분마다)."""
+        if datetime.now() < self.next_outcome:
+            return
+        self.next_outcome = datetime.now() + timedelta(minutes=30)
+        try:
+            store.update_outcomes(collector.fetch_futures_klines)
+        except Exception as e:
+            print(f"  (승률 기록 업데이트 실패: {e} — 다음에 재시도)")
+
     # ── 알림 (전송 실패 시 재전송 대기) ──────────────────────────
     def notify(self, symbol: str, text: str) -> None:
         if not self.notifier.send(text):
@@ -171,12 +191,14 @@ class Watcher:
                 text = self.intro.pop(symbol) + "\n\n" + text
             self.notified_rank[symbol] = rank
             self.notify(symbol, text)
+            self.record(result)
             print()
         elif rank > prev_rank:
             prev_stage = next((k for k, v in STAGE_RANK.items() if v == prev_rank), "")
             self.notified_rank[symbol] = rank
             self.low_streak[symbol] = 0
             self.notify(symbol, build_alert(prev_stage, result))
+            self.record(result)
             print()
         else:
             print(f"[{now}] {symbol}: {result.stage} "
@@ -195,6 +217,7 @@ class Watcher:
             for symbol in list(self.symbols):
                 self.check_symbol(symbol)
                 time.sleep(0.3)  # 요청 제한 보호
+            self.maybe_update_outcomes()
             if not self.symbols and not self.args.scan:
                 print("감시할 심볼이 없어 종료합니다.")
                 return
