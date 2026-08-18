@@ -48,6 +48,9 @@ PATHS = {
 }
 
 
+PATHS["SIGGAP"] = PATHS["SIGA"]  # data_gap 시나리오용 (같은 경로, 다른 심볼)
+
+
 def fake_fetch(symbol, interval, limit):
     return PATHS[symbol]
 
@@ -80,8 +83,18 @@ def main() -> None:
     assert c["first_touch"] == "stop", c["first_touch"]
     print("[OK] 25시간 시점: 승(target1) / 미진입(no_fill) / 패(stop) 판정")
 
+    # 중복 방지: 같은 심볼·단계·비슷한 레벨이 12시간 안에 또 오면 기록하지 않는다
+    n_before = store.stats(DB)["count"]
+    id1 = store.record_signal(sig("SIGA", "triggered", 100, 100, 105, 90), DB,
+                              (T0 + H).to_pydatetime())
+    id2 = store.record_signal(sig("SIGA", "triggered", 99.8, 100.2, 105.3, 90), DB,
+                              (T0 + 2 * H).to_pydatetime())
+    assert id1 == id2 and store.stats(DB)["count"] == n_before, \
+        "진동/재시작으로 인한 같은 셋업 중복 기록을 막아야 함"
+    print("[OK] 중복 방지: 같은 셋업(레벨 0.5% 이내) 재기록 차단")
+
     # 데이터 공백: 캔들 범위가 시그널보다 늦게 시작하면 data_gap으로 종결
-    store.record_signal(sig("SIGA", "triggered", 100, 100, 105, 90), DB,
+    store.record_signal(sig("SIGGAP", "triggered", 100, 100, 105, 90), DB,
                         (T0 - pd.Timedelta(days=30)).to_pydatetime())
     store.update_outcomes(fake_fetch, DB, (T0 + 25 * H).to_pydatetime())
     gap = store._conn(DB).execute(

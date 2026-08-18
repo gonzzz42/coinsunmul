@@ -11,6 +11,7 @@ armed/triggered 알림이 나갈 때마다 SQLite에 기록하고, 시간이 지
 이 통계가 쌓여야 점수·임계치를 감이 아니라 데이터로 조정할 수 있다.
 """
 
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -18,8 +19,14 @@ import pandas as pd
 
 from bot.analyzer import INTERVAL_MINUTES, Analysis
 
-DB_PATH = "signals.sqlite3"
+# 실행 위치(cwd)와 무관하게 항상 프로젝트 폴더의 같은 DB를 쓴다 —
+# 상대 경로면 다른 폴더에서 실행할 때마다 빈 DB가 새로 생겨 기록이 갈라진다.
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "signals.sqlite3")
 HORIZONS = [("ret_1h", 1), ("ret_4h", 4), ("ret_24h", 24)]
+# 같은 심볼·같은 단계의 시그널이 이 시간 안에 비슷한 레벨로 또 오면 중복으로 본다
+DEDUP_HOURS = 12
+DEDUP_TOL = 0.005  # entry/stop 0.5% 이내면 같은 셋업
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -39,16 +46,35 @@ CREATE TABLE IF NOT EXISTS signals (
 
 
 def _conn(path: str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    # timeout: run_watch와 run_stats가 동시에 써도 락 대기로 버틴다
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")  # 읽기·쓰기 동시성 개선
     conn.execute(SCHEMA)
     return conn
 
 
+def _close_to(a: float, b: float, tol: float = DEDUP_TOL) -> bool:
+    return b != 0 and abs(a / b - 1) <= tol
+
+
 def record_signal(a: Analysis, path: str = DB_PATH, now: datetime | None = None) -> int:
-    """armed/triggered 시그널 1건을 기록하고 id를 돌려준다."""
+    """armed/triggered 시그널 1건을 기록하고 id를 돌려준다.
+
+    같은 심볼·같은 단계가 12시간 안에 비슷한 레벨(0.5% 이내)로 이미 기록돼
+    있으면 중복으로 보고 그 id를 돌려준다 — 경계에서 armed<->watching으로
+    진동하거나 봇을 재시작할 때 같은 셋업이 여러 행으로 쌓여 승률 통계를
+    오염시키는 것을 막는다. (armed 후 triggered는 단계가 달라 둘 다 기록됨)
+    """
     now = now or datetime.now(timezone.utc)
     with _conn(path) as conn:
+        since = (now - timedelta(hours=DEDUP_HOURS)).isoformat()
+        for row in conn.execute(
+                "SELECT id, entry, stop FROM signals "
+                "WHERE symbol = ? AND stage = ? AND ts >= ?",
+                (a.symbol, a.stage, since)):
+            if _close_to(row["entry"], a.entry) and _close_to(row["stop"], a.stop):
+                return int(row["id"])  # 같은 셋업 — 새로 기록하지 않음
         cur = conn.execute(
             "INSERT INTO signals (ts, symbol, interval, stage, total, score_a, "
             "score_b, score_c, price, entry, stop, target1, target2, pump_gain_pct) "
@@ -107,51 +133,73 @@ def update_outcomes(fetch_klines, path: str = DB_PATH,
     """
     now = now or datetime.now(timezone.utc)
     now_ts = pd.Timestamp(now)
-    filled = 0
+
+    # 1) 미완 시그널 목록만 읽고 즉시 DB에서 손을 뗀다
     with _conn(path) as conn:
         rows = conn.execute("SELECT * FROM signals WHERE done = 0").fetchall()
-        cache: dict = {}
-        for sig in rows:
-            ts = pd.Timestamp(sig["ts"])
-            interval_min = INTERVAL_MINUTES.get(sig["interval"], 60)
-            key = (sig["symbol"], sig["interval"])
-            if key not in cache:
-                try:
-                    cache[key] = fetch_klines(sig["symbol"], sig["interval"], 1000)
-                except Exception:
-                    cache[key] = None  # 이번 라운드는 건너뛰고 다음에 재시도
-            df = cache[key]
-            if df is None or not len(df):
-                continue
+    if not rows:
+        return 0
 
-            updates: dict = {}
-            if df["time"].iloc[0] > ts:
-                # 시그널이 조회 가능한 캔들 범위보다 오래됨 — 더는 채울 수 없다
+    # 2) 네트워크 조회는 전부 DB 락 밖에서 — 쓰기 트랜잭션을 잡은 채
+    #    네트워크를 기다리면 그 사이 record_signal이 'database is locked'로
+    #    실패해 시그널이 유실된다.
+    cache: dict = {}
+    for sig in rows:
+        key = (sig["symbol"], sig["interval"])
+        if key in cache:
+            continue
+        interval_min = INTERVAL_MINUTES.get(sig["interval"], 60)
+        # 24시간 추적 + 여유가 창에 들어오도록 캔들 수를 계산한다
+        # (1m은 1000개=16.7시간뿐이라 24h 결과가 영원히 안 채워졌었다)
+        need = min(1500, max(1000, 26 * 60 // interval_min + 2))
+        try:
+            cache[key] = fetch_klines(sig["symbol"], sig["interval"], need)
+        except Exception:
+            cache[key] = None  # 이번 라운드는 건너뛰고 다음에 재시도
+
+    # 3) 계산 후 짧은 쓰기 트랜잭션으로 한 번에 반영
+    pending_updates: list = []
+    for sig in rows:
+        ts = pd.Timestamp(sig["ts"])
+        interval_min = INTERVAL_MINUTES.get(sig["interval"], 60)
+        df = cache[(sig["symbol"], sig["interval"])]
+        if df is None or not len(df):
+            continue
+
+        updates: dict = {}
+        if df["time"].iloc[0] > ts:
+            # 시그널이 조회 가능한 캔들 범위보다 오래됨 — 더는 채울 수 없다
+            updates["done"] = 1
+            if sig["first_touch"] is None:
+                updates["first_touch"] = "data_gap"
+        else:
+            for col, hours in HORIZONS:
+                if sig[col] is not None:
+                    continue
+                when = ts + timedelta(hours=hours)
+                close = _closed_close_at(df, pd.Timestamp(when), interval_min, now_ts)
+                if close is not None and sig["price"]:
+                    # 숏 기준: 가격이 내려가면 양수
+                    updates[col] = (sig["price"] - close) / sig["price"] * 100
+            if sig["first_touch"] is None:
+                touch = _first_touch(df, sig, ts, ts + timedelta(hours=24))
+                if touch is not None:
+                    updates["first_touch"] = touch
+            ret24_done = sig["ret_24h"] is not None or "ret_24h" in updates
+            touch_done = sig["first_touch"] is not None or "first_touch" in updates
+            if ret24_done and touch_done:
                 updates["done"] = 1
-                if sig["first_touch"] is None:
-                    updates["first_touch"] = "data_gap"
-            else:
-                for col, hours in HORIZONS:
-                    if sig[col] is not None:
-                        continue
-                    when = ts + timedelta(hours=hours)
-                    close = _closed_close_at(df, pd.Timestamp(when), interval_min, now_ts)
-                    if close is not None and sig["price"]:
-                        # 숏 기준: 가격이 내려가면 양수
-                        updates[col] = (sig["price"] - close) / sig["price"] * 100
-                if sig["first_touch"] is None:
-                    touch = _first_touch(df, sig, ts, ts + timedelta(hours=24))
-                    if touch is not None:
-                        updates["first_touch"] = touch
-                ret24_done = sig["ret_24h"] is not None or "ret_24h" in updates
-                touch_done = sig["first_touch"] is not None or "first_touch" in updates
-                if ret24_done and touch_done:
-                    updates["done"] = 1
 
-            if updates:
+        if updates:
+            pending_updates.append((sig["id"], updates))
+
+    filled = 0
+    if pending_updates:
+        with _conn(path) as conn:
+            for sig_id, updates in pending_updates:
                 sets = ", ".join(f"{k} = ?" for k in updates)
                 conn.execute(f"UPDATE signals SET {sets} WHERE id = ?",
-                             (*updates.values(), sig["id"]))
+                             (*updates.values(), sig_id))
                 filled += len(updates)
     return filled
 
