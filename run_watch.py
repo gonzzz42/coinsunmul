@@ -39,8 +39,8 @@ EVICT_COOLDOWN_HOURS = 4  # 제외된 코인은 이 시간 동안 재편입하�
 # 편입 -> 1시간 감시 -> 제외 -> 다음 스캔에 재편입을 반복하며 같은 알림을 계속 보낸다.
 
 
-def check_once(symbol: str, interval: str, limit: int):
-    futures, spot, oi, funding = fetch_all(symbol, interval, limit)
+def check_once(symbol: str, interval: str, limit: int, agg: bool = True):
+    futures, spot, oi, funding, _ = fetch_all(symbol, interval, limit, agg)
     return analyze(symbol, interval, futures, spot, oi, funding)
 
 
@@ -163,7 +163,8 @@ class Watcher:
         now = datetime.now().strftime("%H:%M")
         self.retry_pending(symbol)
         try:
-            result = check_once(symbol, self.args.interval, self.args.limit)
+            result = check_once(symbol, self.args.interval, self.args.limit,
+                                agg=not getattr(self.args, "no_agg", False))
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 400:
                 print(f"[{now}] {symbol}: 심볼을 찾을 수 없음 (오타이거나 상장 폐지) "
@@ -237,6 +238,8 @@ def main() -> None:
                         help="스캔 주기(분), 기본 30분")
     parser.add_argument("--max-auto", type=int, default=8,
                         help="자동 편입 최대 개수 (기본 8)")
+    parser.add_argument("--no-agg", action="store_true",
+                        help="다중 거래소 OI 집계 끄기 (Binance 단독)")
     args = parser.parse_args()
     if not args.symbols and not args.scan:
         parser.error("감시할 심볼을 주거나 --scan 을 켜세요. 예: "

@@ -50,7 +50,7 @@ def main() -> None:
     # 2) 알림 규칙: 첫 보고서 → 상승만 알림 → 유지 시 침묵
     stages = {"AAAUSDT": iter(["watching", "armed", "armed", "triggered", "collapsed"]),
               "BBBUSDT": iter(["no_setup"] * 13)}
-    run_watch.check_once = lambda sym, i, l: fake_result(sym, next(stages[sym]))
+    run_watch.check_once = lambda sym, *a, **kw: fake_result(sym, next(stages[sym]))
     w.check_symbol("AAAUSDT")
     assert sent[-1].startswith("🔎 스캐너 편입"), sent[-1]
     w.check_symbol("AAAUSDT")

@@ -60,6 +60,14 @@ A. 컨텍스트
 표본 50건이 쌓이기 전까지는 통계가 아니라 소음이다. 봇을 며칠 켜두고
 성적표부터 확인한 뒤에 실거래 여부를 판단할 것.
 
+### 다중 거래소 집계 (Phase 4)
+
+미결제약정(OI)은 **Binance + Bybit + OKX 3곳을 합산**해서 본다 — CoinGlass의
+집계 OI와 같은 개념으로, 청산 연료를 한 거래소만 보면 절반만 보는 것이라서다.
+거래소 한 곳이 장애여도 자동으로 빼고 계속 동작하며, `--no-agg` 로 끌 수 있다.
+CVD는 무료 API에서 taker 매수/매도 구분을 주는 곳이 Binance뿐이라 Binance
+기준을 유지한다 (알트 선물 거래량 대부분이 Binance라 모양은 대표성이 있다).
+
 ## 처음 설정
 
 1. [python.org](https://www.python.org/downloads/)에서 Python 3.11 이상 설치
@@ -123,6 +131,7 @@ bot/
   indicators.py   CVD 등 지표 계산
   analyzer.py     분석 엔진: 구조 탐지 -> 점수 평가 -> 단계 판정 + 레벨 계산
   scanner.py      전 종목 스캐너: 급등 + 유동성 + OI 급증 후보 선별
+  aggregate.py    다중 거래소 OI 집계 (Binance + Bybit + OKX)
   store.py        시그널 기록 + 승률·수익률 자동 추적 (SQLite)
   notifier.py     콘솔 + 텔레그램 알림
   chart.py        검증용 차트 (선택 도구)
@@ -141,8 +150,8 @@ PLAN.md           전체 설계·로드맵
 - [x] Phase 0~1: 수집기 + CVD 계산
 - [x] Phase 2: 분석 엔진(단계 판정 + 트레이드 플랜) + 감시·알림
 - [x] Phase 3: 전 종목 자동 스캐너 + 감시 자동 편입/제외
+- [x] Phase 4: 다중 거래소 OI 집계 (Bybit, OKX)
 - [x] Phase 5: 시그널 기록 → 승률·수익률 통계 (점수 조정 근거)
-- [ ] Phase 4: 다중 거래소 집계 (Bybit, OKX)
 - [ ] Phase 6: 백테스트, 반자동 주문
 
 ## 주의
